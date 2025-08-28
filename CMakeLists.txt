@@ -79,9 +79,11 @@ endif()
 
 set(ACFWCX_FILES
   ${ROOTSRC}/acfwcx.cc
+  ${ROOTSRC}/acfwcx.def
 )
 add_library(acfwcx SHARED ${ACFWCX_FILES})
 target_link_libraries(acfwcx acf libzstd.a libc++.a)
+
 
 set(ACFCLI_FILES
   ${ROOTSRC}/acfcli.cc
