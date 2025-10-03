@@ -11,7 +11,7 @@ std::string WStringToString(const std::wstring& s);
 namespace acf
 {
   constexpr uint32_t ACF_MAGIC = 0x39464341;
-  constexpr uint32_t ACF_VERSION = 0x10000900;
+  constexpr uint32_t ACF_VERSION = 0x20000900;
 
   // Callback function for progress reporting.
   // Parameters: current file path, progress for the current file (0-1), overall progress (0-1).

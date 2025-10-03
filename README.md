@@ -77,3 +77,5 @@ Commands:
 # Changes Log
 **v0.9.1**
 - First Initial Release
+**v0.9.2**
+- Fix create/append archive

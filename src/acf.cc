@@ -90,24 +90,71 @@ namespace acf
     m_CallbackFunc = callbackf;
   }
 
-  void ACFArchiver::Create(const std::string& archivePath, 
+  void ACFArchiver::Create(const std::string& archivePath,
               const std::vector<std::string>& inputPaths,
               const std::string& basePath,
               const std::string& internalBasePath)
-  {
+{
     namespace fs = std::filesystem;
 
-    std::ofstream archiveFile(archivePath, std::ios::binary | std::ios::trunc);
-    if (!archiveFile) {
-        throw std::runtime_error("Could not create archive file: " + archivePath);
-    }
-
     ACFHeader header;
-    archiveFile.write(reinterpret_cast<const char*>(&header), sizeof(ACFHeader)); // Placeholder
-
     std::vector<ACFEntryData> centralDirectory;
     std::vector<std::string> pathStrings;
-    
+    std::unordered_set<std::string> existingInternalPaths;
+
+    std::fstream archiveFile;
+    bool existingArchive = fs::exists(archivePath);
+
+    if (existingArchive) {
+        archiveFile.open(archivePath, std::ios::in | std::ios::out | std::ios::binary | std::ios::ate);
+        if (!archiveFile) {
+            throw std::runtime_error("Could not open existing archive file: " + archivePath);
+        }
+        std::streampos endPos = archiveFile.tellg();
+        archiveFile.seekg(0);
+
+        archiveFile.read(reinterpret_cast<char*>(&header), sizeof(ACFHeader));
+        if (header.magic != ACF_MAGIC) {
+            throw std::runtime_error("Not a valid ACF archive.");
+        }
+
+        if(header.centralDirOffset > 0 && header.centralDirOffset < endPos) {
+            size_t cdSize = endPos - static_cast<std::streamoff>(header.centralDirOffset);
+            archiveFile.seekg(header.centralDirOffset);
+
+            std::vector<char> centralDirBuffer(cdSize);
+            archiveFile.read(centralDirBuffer.data(), cdSize);
+            if (crc32(centralDirBuffer.data(), cdSize) != header.centralDirCRC32) {
+                throw std::runtime_error("Central directory CRC32 mismatch. Archive is likely corrupted.");
+            }
+
+            const char* buffer_ptr = centralDirBuffer.data();
+            const char* buffer_end = centralDirBuffer.data() + cdSize;
+
+            for (uint64_t i = 0; i < header.entryCount; ++i) {
+                if (buffer_ptr + sizeof(ACFEntryData) > buffer_end) break;
+                ACFEntryData entryData;
+                memcpy(&entryData, buffer_ptr, sizeof(ACFEntryData));
+                buffer_ptr += sizeof(ACFEntryData);
+
+                if (buffer_ptr + entryData.pathLength > buffer_end) break;
+                std::string path(buffer_ptr, entryData.pathLength);
+                buffer_ptr += entryData.pathLength;
+
+                centralDirectory.push_back(entryData);
+                pathStrings.push_back(path);
+                existingInternalPaths.insert(path);
+            }
+        }
+        archiveFile.seekp(header.centralDirOffset);
+    } else {
+        archiveFile.open(archivePath, std::ios::out | std::ios::binary);
+        if (!archiveFile) {
+            throw std::runtime_error("Could not create archive file: " + archivePath);
+        }
+        archiveFile.write(reinterpret_cast<const char*>(&header), sizeof(ACFHeader)); // Placeholder
+    }
+
     fs::path fsBasePath(basePath);
     std::unordered_set<fs::path> processedPaths;
 
@@ -124,7 +171,7 @@ namespace acf
                 processedPaths.insert(inputPath);
             }
             for (const auto& dir_entry : fs::recursive_directory_iterator(inputPath)) {
-                 if (processedPaths.count(dir_entry.path())) continue;
+                if (processedPaths.count(dir_entry.path())) continue;
                 if (dir_entry.is_directory()) {
                     dirsToProcess.push_back(dir_entry.path());
                 } else if (dir_entry.is_regular_file()) {
@@ -137,7 +184,7 @@ namespace acf
             processedPaths.insert(inputPath);
         }
     }
-    
+
     std::sort(dirsToProcess.begin(), dirsToProcess.end());
     std::sort(filesToProcess.begin(), filesToProcess.end());
 
@@ -149,9 +196,11 @@ namespace acf
             internalPath += '\\';
         }
 
+        if (existingInternalPaths.count(internalPath)) continue;
+
         ACFEntryData dirEntry{};
         dirEntry.type = EntryType::Directory;
-        
+
         auto ftime = fs::last_write_time(dirPath);
         ULARGE_INTEGER uli;
         uli.QuadPart = ftime.time_since_epoch().count();
@@ -159,10 +208,10 @@ namespace acf
         ft.dwLowDateTime = uli.LowPart;
         ft.dwHighDateTime = uli.HighPart;
         dirEntry.filedatetime = FileTimeToDosDateTime(ft);
-        
+
         dirEntry.fileattribute = GetFileAttributesW(dirPath.c_str());
         dirEntry.pathLength = static_cast<uint16_t>(internalPath.length());
-        
+
         centralDirectory.push_back(dirEntry);
         pathStrings.push_back(internalPath);
     }
@@ -175,6 +224,11 @@ namespace acf
         fs::path internalPath_fs = fs::path(internalBasePath) / relativePath;
         std::string internalPath = WStringToString(internalPath_fs.make_preferred().wstring());
 
+        if (existingInternalPaths.count(internalPath)) {
+            filesProcessed++;
+            continue;
+        }
+
         if (m_CallbackFunc) {
             m_CallbackFunc(internalPath, 0.0f, filesProcessed / totalFiles);
         }
@@ -183,7 +237,7 @@ namespace acf
         fileEntry.type = EntryType::File;
         fileEntry.originalSize = fs::file_size(filePath);
         fileEntry.dataOffset = archiveFile.tellp();
-        
+
         FILETIME ft;
         WIN32_FILE_ATTRIBUTE_DATA fad;
         if (GetFileAttributesExW(filePath.generic_wstring().c_str(), GetFileExInfoStandard, &fad))
@@ -203,7 +257,7 @@ namespace acf
 
         ZSTD_CStream_Ptr cstream(ZSTD_createCStream());
         ZSTD_initCStream(cstream.get(), 9);
-        
+
         size_t const inBuffSize = ZSTD_CStreamInSize();
         std::vector<char> inBuff(inBuffSize);
         size_t const outBuffSize = ZSTD_CStreamOutSize();
@@ -234,7 +288,7 @@ namespace acf
         }
         archiveFile.write(outBuff.data(), outBuffer.pos);
         totalCompressedSize += outBuffer.pos;
-        
+
         fileEntry.crc32 = crc;
         fileEntry.compressedSize = totalCompressedSize;
         centralDirectory.push_back(fileEntry);
@@ -248,7 +302,7 @@ namespace acf
 
     header.centralDirOffset = archiveFile.tellp();
     header.entryCount = centralDirectory.size();
-    
+
     std::vector<char> centralDirBuffer;
     for (size_t i = 0; i < centralDirectory.size(); ++i) {
         const char* entry_ptr = reinterpret_cast<const char*>(&centralDirectory[i]);
@@ -270,14 +324,70 @@ namespace acf
   void ACFArchiver::CreateData(const std::string& archivePath, 
               const std::string& internalPath,
               const std::vector<uint8_t>& data)
-  {
-    std::ofstream archiveFile(archivePath, std::ios::binary | std::ios::trunc);
-    if (!archiveFile) {
-      throw std::runtime_error("Could not create archive file: " + archivePath);
-    }
+{
+    namespace fs = std::filesystem;
 
     ACFHeader header;
-    archiveFile.write(reinterpret_cast<const char*>(&header), sizeof(ACFHeader));
+    std::vector<ACFEntryData> centralDirectory;
+    std::vector<std::string> pathStrings;
+    std::unordered_set<std::string> existingInternalPaths;
+
+    std::fstream archiveFile;
+    bool existingArchive = fs::exists(archivePath);
+
+    if (existingArchive) {
+        archiveFile.open(archivePath, std::ios::in | std::ios::out | std::ios::binary | std::ios::ate);
+        if (!archiveFile) {
+            throw std::runtime_error("Could not open existing archive file: " + archivePath);
+        }
+        std::streampos endPos = archiveFile.tellg();
+        archiveFile.seekg(0);
+
+        archiveFile.read(reinterpret_cast<char*>(&header), sizeof(ACFHeader));
+        if (header.magic != ACF_MAGIC) {
+            throw std::runtime_error("Not a valid ACF archive.");
+        }
+
+        if(header.centralDirOffset > 0 && header.centralDirOffset < endPos) {
+            size_t cdSize = endPos - static_cast<std::streamoff>(header.centralDirOffset);
+            archiveFile.seekg(header.centralDirOffset);
+
+            std::vector<char> centralDirBuffer(cdSize);
+            archiveFile.read(centralDirBuffer.data(), cdSize);
+            if (crc32(centralDirBuffer.data(), cdSize) != header.centralDirCRC32) {
+                throw std::runtime_error("Central directory CRC32 mismatch. Archive is likely corrupted.");
+            }
+
+            const char* buffer_ptr = centralDirBuffer.data();
+            const char* buffer_end = centralDirBuffer.data() + cdSize;
+
+            for (uint64_t i = 0; i < header.entryCount; ++i) {
+                if (buffer_ptr + sizeof(ACFEntryData) > buffer_end) break;
+                ACFEntryData entryData;
+                memcpy(&entryData, buffer_ptr, sizeof(ACFEntryData));
+                buffer_ptr += sizeof(ACFEntryData);
+
+                if (buffer_ptr + entryData.pathLength > buffer_end) break;
+                std::string path(buffer_ptr, entryData.pathLength);
+                buffer_ptr += entryData.pathLength;
+
+                centralDirectory.push_back(entryData);
+                pathStrings.push_back(path);
+                existingInternalPaths.insert(path);
+            }
+        }
+        archiveFile.seekp(header.centralDirOffset);
+    } else {
+        archiveFile.open(archivePath, std::ios::out | std::ios::binary);
+        if (!archiveFile) {
+            throw std::runtime_error("Could not create archive file: " + archivePath);
+        }
+        archiveFile.write(reinterpret_cast<const char*>(&header), sizeof(ACFHeader)); // Placeholder
+    }
+
+    if (existingInternalPaths.count(internalPath)) {
+        return; // Or throw an error, for now just skip.
+    }
 
     const uint64_t dataOffset = archiveFile.tellp();
 
@@ -321,20 +431,25 @@ namespace acf
     entryData.fileattribute = FILE_ATTRIBUTE_ARCHIVE;
     entryData.pathLength = static_cast<uint16_t>(internalPath.length());
 
+    centralDirectory.push_back(entryData);
+    pathStrings.push_back(internalPath);
+
     header.centralDirOffset = archiveFile.tellp();
-    header.entryCount = 1;
+    header.entryCount = centralDirectory.size();
 
     std::vector<char> centralDirBuffer;
-    const char* entry_ptr = reinterpret_cast<const char*>(&entryData);
-    centralDirBuffer.insert(centralDirBuffer.end(), entry_ptr, entry_ptr + sizeof(ACFEntryData));
-    centralDirBuffer.insert(centralDirBuffer.end(), internalPath.begin(), internalPath.end());
+    for (size_t i = 0; i < centralDirectory.size(); ++i) {
+        const char* entry_ptr = reinterpret_cast<const char*>(&centralDirectory[i]);
+        centralDirBuffer.insert(centralDirBuffer.end(), entry_ptr, entry_ptr + sizeof(ACFEntryData));
+        centralDirBuffer.insert(centralDirBuffer.end(), pathStrings[i].begin(), pathStrings[i].end());
+    }
     
     archiveFile.write(centralDirBuffer.data(), centralDirBuffer.size());
     header.centralDirCRC32 = crc32(centralDirBuffer.data(), centralDirBuffer.size());
 
     archiveFile.seekp(0);
     archiveFile.write(reinterpret_cast<const char*>(&header), sizeof(ACFHeader));
-  }
+}
 
   void ACFArchiver::ExtractAll(const std::string& archivePath,
                   const std::string& outputPath)
