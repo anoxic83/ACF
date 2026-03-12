@@ -28,9 +28,9 @@ std::string WStringToString(const std::wstring& s) {
     return r;
 }
 
-namespace acf {
-
-  // Prosta kalkulacja CRC32 (wymagana przez Total Commander do testowania archiwów)
+namespace acf
+{
+  // Basic CRC32 implementation
   uint32_t CalculateCRC32(uint32_t crc, const uint8_t* buf, size_t len) {
       static uint32_t table[256];
       static bool have_table = false;
@@ -53,13 +53,14 @@ namespace acf {
       return ~crc;
   }
 
-  // Wrappery RAII dla ZSTD, żeby uniknąć wycieków w przypadku rzucenia wyjątków
+  // RAII Wrappers for ZSTD
   struct ZSTDCStreamDeleter { void operator()(ZSTD_CStream* s) { ZSTD_freeCStream(s); } };
   struct ZSTDDStreamDeleter { void operator()(ZSTD_DStream* s) { ZSTD_freeDStream(s); } };
   using CStreamPtr = std::unique_ptr<ZSTD_CStream, ZSTDCStreamDeleter>;
   using DStreamPtr = std::unique_ptr<ZSTD_DStream, ZSTDDStreamDeleter>;
 
   ACFArchiver::ACFArchiver() : m_CallbackFunc(nullptr) {}
+
   ACFArchiver::~ACFArchiver() {}
 
   void ACFArchiver::SetCallback(const CallbackFunc callbackf) {
@@ -85,7 +86,7 @@ namespace acf {
     std::vector<std::string> pathStrings;
     fs::path fsBasePath(basePath);
 
-    // FIX: Używamy std::set z absolutnymi znormalizowanymi ścieżkami, aby wyeliminować duplikaty!
+    // Using std::set with lexically_normal absolute paths eliminates duplicate files!
     std::set<fs::path> filesToProcess;
     std::set<fs::path> dirsToProcess;
 
@@ -108,7 +109,7 @@ namespace acf {
         }
     }
 
-    // Katalogi
+    // Process Directories
     for (const auto& dirPath : dirsToProcess) {
         fs::path relativePath = fs::relative(dirPath, fs::absolute(fsBasePath));
         if (relativePath.empty() || relativePath == ".") continue;
@@ -124,23 +125,26 @@ namespace acf {
         pathStrings.push_back(internalPath);
     }
 
-    // Alokujemy bufory i strumień ZSTD TYLKO RAZ dla wszystkich plików (Ogromny skok wydajności)
+    // Optimize: Create Context and buffers ONLY ONCE for the whole archive
     CStreamPtr cstream(ZSTD_createCStream());
     if (!cstream) throw std::runtime_error("ZSTD_createCStream error");
-
     std::vector<char> inBuff(ZSTD_CStreamInSize());
     std::vector<char> outBuff(ZSTD_CStreamOutSize());
 
     float totalFiles = filesToProcess.size();
     float filesProcessed = 0;
 
-    // Pliki
+    // Process Files
     for (const auto& filePath : filesToProcess) {
         fs::path relativePath = fs::relative(filePath, fs::absolute(fsBasePath));
         fs::path internalPath_fs = fs::path(internalBasePath) / relativePath;
         std::string internalPath = WStringToString(internalPath_fs.make_preferred().wstring());
 
-        if (m_CallbackFunc) m_CallbackFunc(internalPath, 0.0f, filesProcessed / totalFiles);
+        if (m_CallbackFunc) {
+            if (!m_CallbackFunc(internalPath, 0, 0, 0, filesProcessed / totalFiles)) {
+                throw std::runtime_error("Operation aborted by user.");
+            }
+        }
 
         ACFEntryData fileEntry;
         fileEntry.type = EntryType::File;
@@ -152,15 +156,16 @@ namespace acf {
 
         std::ifstream inputFile(filePath, std::ios::binary);
         if (inputFile) {
-            ZSTD_initCStream(cstream.get(), 19); // Resetuje kontekst dla nowego pliku
+            ZSTD_initCStream(cstream.get(), 19);
             
+            uint64_t totalRead = 0;
             uint64_t totalCompressedSize = 0;
             for (;;) {
                 inputFile.read(inBuff.data(), inBuff.size());
                 size_t readCount = inputFile.gcount();
                 if (readCount == 0) break;
 
-                // Aktualizacja CRC
+                totalRead += readCount;
                 currentCrc32 = CalculateCRC32(currentCrc32, reinterpret_cast<const uint8_t*>(inBuff.data()), readCount);
 
                 ZSTD_inBuffer inBuffer = { inBuff.data(), readCount, 0 };
@@ -169,6 +174,15 @@ namespace acf {
                     ZSTD_compressStream(cstream.get(), &outBuffer, &inBuffer);
                     archiveFile.write(outBuff.data(), outBuffer.pos);
                     totalCompressedSize += outBuffer.pos;
+                }
+
+                // Chunk-based Callback Progress update
+                if (m_CallbackFunc) {
+                    float fileProg = fileEntry.originalSize > 0 ? static_cast<float>(totalRead) / fileEntry.originalSize : 1.0f;
+                    float genProg = (filesProcessed + fileProg) / totalFiles;
+                    if (!m_CallbackFunc(internalPath, totalRead, fileEntry.originalSize, readCount, genProg)) {
+                        throw std::runtime_error("Operation aborted by user.");
+                    }
                 }
             }
 
@@ -185,7 +199,6 @@ namespace acf {
         }
 
         filesProcessed++;
-        if (m_CallbackFunc) m_CallbackFunc(internalPath, 1.0f, filesProcessed / totalFiles);
     }
 
     const uint64_t centralDirStartOffset = archiveFile.tellp();
@@ -199,15 +212,61 @@ namespace acf {
     archiveFile.seekp(0);
     archiveFile.write(reinterpret_cast<const char*>(&header), sizeof(ACFHeader));
 
-    if (m_CallbackFunc) m_CallbackFunc("Done.", 1.0f, 1.0f);
+    if (m_CallbackFunc) m_CallbackFunc("Done.", 0, 0, 0, 1.0f);
   }
 
-  // Metody Extract, List, CreateData analogicznie...
-  // Poniżej zaktualizowana funkcja Extract - również optymalizacja z RAII
+  void ACFArchiver::CreateData(const std::string& archivePath, 
+              const std::string& internalPath,
+              const std::vector<uint8_t>& data)
+  {
+    std::ofstream archiveFile(archivePath, std::ios::binary | std::ios::trunc);
+    if (!archiveFile) throw std::runtime_error("Could not create archive file: " + archivePath);
+
+    ACFHeader header;
+    archiveFile.write(reinterpret_cast<const char*>(&header), sizeof(ACFHeader));
+    const uint64_t dataOffset = archiveFile.tellp();
+
+    CStreamPtr cstream(ZSTD_createCStream());
+    ZSTD_initCStream(cstream.get(), 19);
+
+    std::vector<char> cBuff(ZSTD_CStreamOutSize());
+    ZSTD_inBuffer inBuff = { data.data(), data.size(), 0 };
+    
+    uint64_t compressedSize = 0;
+    while (inBuff.pos < inBuff.size) {
+        ZSTD_outBuffer outBuff = { cBuff.data(), cBuff.size(), 0 };
+        ZSTD_compressStream(cstream.get(), &outBuff, &inBuff);
+        archiveFile.write(cBuff.data(), outBuff.pos);
+        compressedSize += outBuff.pos;
+    }
+
+    ZSTD_outBuffer outBuff = { cBuff.data(), cBuff.size(), 0 };
+    ZSTD_endStream(cstream.get(), &outBuff);
+    archiveFile.write(cBuff.data(), outBuff.pos);
+    compressedSize += outBuff.pos;
+    
+    const uint64_t centralDirOffset = archiveFile.tellp();
+
+    ACFEntryData entryData;
+    entryData.type = EntryType::File;
+    entryData.originalSize = data.size();
+    entryData.compressedSize = compressedSize;
+    entryData.dataOffset = dataOffset;
+    entryData.crc32 = CalculateCRC32(0, data.data(), data.size());
+    entryData.pathLength = static_cast<uint16_t>(internalPath.length());
+
+    archiveFile.write(reinterpret_cast<const char*>(&entryData), sizeof(ACFEntryData));
+    archiveFile.write(internalPath.c_str(), internalPath.length());
+
+    header.entryCount = 1;
+    header.centralDirOffset = centralDirOffset;
+    archiveFile.seekp(0);
+    archiveFile.write(reinterpret_cast<const char*>(&header), sizeof(ACFHeader));
+  }
 
   void ACFArchiver::ExtractAll(const std::string& archivePath, const std::string& outputPath)
   {
-      Extract(archivePath, {}, outputPath); // Uproszczenie, wykorzystuje wspólną logikę
+    Extract(archivePath, {}, outputPath);
   }
 
   void ACFArchiver::Extract(const std::string& archivePath,
@@ -239,7 +298,6 @@ namespace acf {
     std::unordered_set<std::string> filesToExtractSet(archFileNames.begin(), archFileNames.end());
     fs::path outputDir(outputPath);
 
-    // Optymalizacja dekompresji
     DStreamPtr dstream(ZSTD_createDStream());
     std::vector<char> inBuff(ZSTD_DStreamInSize());
     std::vector<char> outBuff(ZSTD_DStreamOutSize());
@@ -254,8 +312,6 @@ namespace acf {
         const auto& path = pair.second;
         fs::path fullPath = outputDir / fs::path(path);
 
-        if (m_CallbackFunc) m_CallbackFunc(path, 0.0f, entriesProcessed / totalEntries);
-
         if (entry.type == EntryType::Directory) {
             fs::create_directories(fullPath);
         } else if (entry.type == EntryType::File) {
@@ -268,6 +324,7 @@ namespace acf {
             ZSTD_initDStream(dstream.get());
 
             uint64_t totalRead = 0;
+            uint64_t totalWritten = 0;
             while (totalRead < entry.compressedSize) {
                 size_t toRead = std::min(static_cast<uint64_t>(inBuff.size()), entry.compressedSize - totalRead);
                 archiveFile.read(inBuff.data(), toRead);
@@ -278,28 +335,100 @@ namespace acf {
                     ZSTD_outBuffer outBuffer = { outBuff.data(), outBuff.size(), 0 };
                     ZSTD_decompressStream(dstream.get(), &outBuffer, &inBuffer);
                     outputFile.write(outBuff.data(), outBuffer.pos);
+                    totalWritten += outBuffer.pos;
+
+                    if (m_CallbackFunc) {
+                        float fileProg = entry.originalSize > 0 ? static_cast<float>(totalWritten) / entry.originalSize : 1.0f;
+                        float genProg = (entriesProcessed + fileProg) / totalEntries;
+                        if (!m_CallbackFunc(path, totalWritten, entry.originalSize, outBuffer.pos, genProg)) {
+                            throw std::runtime_error("Operation aborted by user.");
+                        }
+                    }
                 }
             }
         }
         entriesProcessed++;
-        if (m_CallbackFunc) m_CallbackFunc(path, 1.0f, entriesProcessed / totalEntries);
     }
-    if (m_CallbackFunc) m_CallbackFunc("Done.", 1.0f, 1.0f);
+    if (m_CallbackFunc) m_CallbackFunc("Done.", 0, 0, 0, 1.0f);
   }
 
-std::vector<uint8_t> ACFArchiver::ExtractData(const std::string& archivePath,
-                                  const std::string& archFileName)
+  void ACFArchiver::ExtractSingleFile(const std::string& archivePath, const std::string& archFileName, const std::string& destFilePath)
   {
     std::ifstream archiveFile(archivePath, std::ios::binary);
-    if (!archiveFile) {
-        throw std::runtime_error("Could not open archive file: " + archivePath);
-    }
+    if (!archiveFile) throw std::runtime_error("Could not open archive: " + archivePath);
 
     ACFHeader header;
     archiveFile.read(reinterpret_cast<char*>(&header), sizeof(ACFHeader));
-    if (header.magic != ACF_MAGIC) {
-        throw std::runtime_error("Not a valid ACF archive.");
+    if (header.magic != ACF_MAGIC) throw std::runtime_error("Not a valid ACF archive.");
+
+    archiveFile.seekg(header.centralDirOffset);
+    ACFEntryData targetEntry;
+    bool found = false;
+
+    for (uint64_t i = 0; i < header.entryCount; ++i) {
+        archiveFile.read(reinterpret_cast<char*>(&targetEntry), sizeof(ACFEntryData));
+        std::string path(targetEntry.pathLength, '\0');
+        archiveFile.read(&path[0], targetEntry.pathLength);
+        if (path == archFileName) {
+            found = true;
+            break;
+        }
     }
+
+    if (!found) throw std::runtime_error("File not found in archive: " + archFileName);
+    if (targetEntry.type != EntryType::File) return;
+
+    bool isTestOperation = destFilePath.empty();
+    std::ofstream outputFile;
+    
+    if (!isTestOperation) {
+        outputFile.open(destFilePath, std::ios::binary | std::ios::trunc);
+        if (!outputFile) throw std::runtime_error("Cannot create output file.");
+    }
+
+    archiveFile.seekg(targetEntry.dataOffset);
+    DStreamPtr dstream(ZSTD_createDStream());
+    ZSTD_initDStream(dstream.get());
+
+    std::vector<char> inBuff(ZSTD_DStreamInSize());
+    std::vector<char> outBuff(ZSTD_DStreamOutSize());
+
+    uint64_t totalRead = 0;
+    uint64_t totalWritten = 0;
+
+    while (totalRead < targetEntry.compressedSize) {
+        size_t toRead = std::min(static_cast<uint64_t>(inBuff.size()), targetEntry.compressedSize - totalRead);
+        archiveFile.read(inBuff.data(), toRead);
+        totalRead += toRead;
+
+        ZSTD_inBuffer inBuffer = { inBuff.data(), toRead, 0 };
+        while (inBuffer.pos < inBuffer.size) {
+            ZSTD_outBuffer outBuffer = { outBuff.data(), outBuff.size(), 0 };
+            ZSTD_decompressStream(dstream.get(), &outBuffer, &inBuffer);
+            
+            if (!isTestOperation) {
+                outputFile.write(outBuff.data(), outBuffer.pos);
+            }
+            totalWritten += outBuffer.pos;
+
+            if (m_CallbackFunc) {
+                float fileProg = targetEntry.originalSize > 0 ? static_cast<float>(totalWritten) / targetEntry.originalSize : 1.0f;
+                if (!m_CallbackFunc(archFileName, totalWritten, targetEntry.originalSize, outBuffer.pos, fileProg)) {
+                    throw std::runtime_error("Operation aborted by user.");
+                }
+            }
+        }
+    }
+  }
+
+  std::vector<uint8_t> ACFArchiver::ExtractData(const std::string& archivePath, const std::string& archFileName)
+  {
+    std::ifstream archiveFile(archivePath, std::ios::binary);
+    if (!archiveFile) throw std::runtime_error("Could not open archive file: " + archivePath);
+
+    ACFHeader header;
+    archiveFile.read(reinterpret_cast<char*>(&header), sizeof(ACFHeader));
+    if (header.magic != ACF_MAGIC) throw std::runtime_error("Not a valid ACF archive.");
 
     archiveFile.seekg(header.centralDirOffset);
     
@@ -318,24 +447,15 @@ std::vector<uint8_t> ACFArchiver::ExtractData(const std::string& archivePath,
         }
     }
 
-    if (!found) {
-        throw std::runtime_error("File not found in archive: " + archFileName);
-    }
-
-    if (targetEntry.type != EntryType::File) {
-        throw std::runtime_error("Cannot extract data from a directory entry: " + archFileName);
-    }
+    if (!found) throw std::runtime_error("File not found in archive: " + archFileName);
+    if (targetEntry.type != EntryType::File) throw std::runtime_error("Cannot extract data from a directory entry.");
 
     archiveFile.seekg(targetEntry.dataOffset);
 
-    size_t const inBuffSize = ZSTD_DStreamInSize();
-    std::vector<char> inBuff(inBuffSize);
-    size_t const outBuffSize = ZSTD_DStreamOutSize();
-    std::vector<char> outBuff(outBuffSize);
-
-    ZSTD_DStream* const dstream = ZSTD_createDStream();
-    if (dstream == NULL) { throw std::runtime_error("ZSTD_createDStream() error"); }
-    ZSTD_initDStream(dstream);
+    DStreamPtr dstream(ZSTD_createDStream());
+    ZSTD_initDStream(dstream.get());
+    std::vector<char> inBuff(ZSTD_DStreamInSize());
+    std::vector<char> outBuff(ZSTD_DStreamOutSize());
 
     std::vector<uint8_t> decompressedData;
     decompressedData.reserve(targetEntry.originalSize);
@@ -349,53 +469,33 @@ std::vector<uint8_t> ACFArchiver::ExtractData(const std::string& archivePath,
         ZSTD_inBuffer inBuffer = { inBuff.data(), toRead, 0 };
         while (inBuffer.pos < inBuffer.size) {
             ZSTD_outBuffer outBuffer = { outBuff.data(), outBuff.size(), 0 };
-            size_t const ret = ZSTD_decompressStream(dstream, &outBuffer, &inBuffer);
-            if (ZSTD_isError(ret)) {
-                ZSTD_freeDStream(dstream);
-                throw std::runtime_error("ZSTD_decompressStream error");
-            }
+            ZSTD_decompressStream(dstream.get(), &outBuffer, &inBuffer);
             decompressedData.insert(decompressedData.end(), reinterpret_cast<uint8_t*>(outBuffer.dst), reinterpret_cast<uint8_t*>(outBuffer.dst) + outBuffer.pos);
         }
     }
-
-    ZSTD_freeDStream(dstream);
-
     return decompressedData;
   }
                                   
   std::vector<std::string> ACFArchiver::List(const std::string& archivePath)
   {
     std::ifstream archiveFile(archivePath, std::ios::binary);
-    if (!archiveFile)
-    {
-      throw std::runtime_error("Could not open archive file: " + archivePath);
-    }
+    if (!archiveFile) throw std::runtime_error("Could not open archive file: " + archivePath);
 
     ACFHeader header;
     archiveFile.read(reinterpret_cast<char*>(&header), sizeof(ACFHeader));
-
-    if (header.magic != ACF_MAGIC)
-    {
-      throw std::runtime_error("Not a valid ACF archive: " + archivePath);
-    }
+    if (header.magic != ACF_MAGIC) throw std::runtime_error("Not a valid ACF archive: " + archivePath);
 
     archiveFile.seekg(header.centralDirOffset);
-
     std::vector<std::string> fileList;
     fileList.reserve(header.entryCount);
 
-    for (uint64_t i = 0; i < header.entryCount; ++i)
-    {
+    for (uint64_t i = 0; i < header.entryCount; ++i) {
       ACFEntryData entryData;
       archiveFile.read(reinterpret_cast<char*>(&entryData), sizeof(ACFEntryData));
-      
       std::string path(entryData.pathLength, '\0');
       archiveFile.read(&path[0], entryData.pathLength);
-      
       fileList.push_back(path);
     }
-
     return fileList;
   }
-
 } // namespace acf

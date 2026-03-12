@@ -13,7 +13,9 @@ namespace acf
   constexpr uint32_t ACF_MAGIC = 0x39464341;
   constexpr uint32_t ACF_VERSION = 0x10000900;
 
-  using CallbackFunc = std::function<void(const std::string& currentFile, float currentFileProgress, float generalProgress)>;
+  // Callback function for progress reporting and abortion.
+  // Returns false if the operation should be aborted (e.g. user canceled).
+  using CallbackFunc = std::function<bool(const std::string& currentFile, uint64_t fileBytesProcessed, uint64_t fileTotalBytes, uint64_t chunkBytes, float generalProgress)>;
 
   enum class EntryType: uint8_t
   {
@@ -51,11 +53,13 @@ namespace acf
     virtual ~ACFArchiver();
     void SetCallback(const CallbackFunc callbackf);
     
+    // Creates an archive from a list of files and directories.
     void Create(const std::string& archivePath, 
                 const std::vector<std::string>& inputPaths,
                 const std::string& basePath,
                 const std::string& internalBasePath);
 
+    // Creates a new archive containing a single entry from raw data.
     void CreateData(const std::string& archivePath, 
                 const std::string& internalPath,
                 const std::vector<uint8_t>& data);
@@ -67,6 +71,13 @@ namespace acf
                 const std::vector<std::string>& archFileNames,
                 const std::string& outputPath);
 
+    // Extracts a single file, streaming it directly to disk to prevent RAM exhaustion.
+    // If destFilePath is empty, it acts as a test (decodes but writes nowhere).
+    void ExtractSingleFile(const std::string& archivePath, 
+                           const std::string& archFileName, 
+                           const std::string& destFilePath);
+
+    // Kept for backward compatibility or very small files.
     std::vector<uint8_t> ExtractData(const std::string& archivePath,
                                     const std::string& archFileName);
                                     

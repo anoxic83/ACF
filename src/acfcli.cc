@@ -4,7 +4,7 @@
 #include <string>
 #include <iomanip>
 
-void displayProgress(const std::string& currentFile, float currentFileProgress, float generalProgress) {
+bool displayProgress(const std::string& currentFile, uint64_t fileProcessed, uint64_t fileTotal, uint64_t chunkBytes, float generalProgress) {
     int barWidth = 50;
     
     // Truncate the filename if it's too long
@@ -14,15 +14,17 @@ void displayProgress(const std::string& currentFile, float currentFileProgress, 
     }
 
     std::cout << "[";
-    int pos = barWidth * generalProgress;
+    int pos = static_cast<int>(barWidth * generalProgress);
     for (int i = 0; i < barWidth; ++i) {
         if (i < pos) std::cout << "=";
         else if (i == pos) std::cout << ">";
         else std::cout << " ";
     }
-    std::cout << "] " << std::fixed << std::setprecision(1) << (generalProgress * 100.0) << " ";
+    std::cout << "] " << std::fixed << std::setprecision(1) << (generalProgress * 100.0) << "% ";
     std::cout << std::left << std::setw(40) << displayFile << "\r";
     std::cout.flush();
+    
+    return true; // Return true to continue the operation
 }
 
 void printUsage() {

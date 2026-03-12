@@ -17,6 +17,8 @@ struct ArchiveState {
     std::wstring archivePath;
 };
 
+tProcessDataProcW g_PackProgressProc = nullptr;
+
 std::map<HANDLE, std::unique_ptr<ArchiveState>> g_OpenArchives;
 long g_NextHandle = 0;
 
@@ -79,13 +81,13 @@ extern "C" __declspec(dllexport) int __stdcall ReadHeaderExW(HANDLE hArcData, tH
     std::wstring wpath = StringToWString(path);
     wcsncpy_s(HeaderData->FileName, wpath.c_str(), _TRUNCATE);
 
-    // FIX: Poprawne maskowanie dla plików powyżej 4GB! Total Commander tego wymaga.
+    // Support for files > 4GB 
     HeaderData->UnpSize = static_cast<unsigned int>(entry.originalSize & 0xFFFFFFFF);
     HeaderData->UnpSizeHigh = static_cast<unsigned int>(entry.originalSize >> 32);
     HeaderData->PackSize = static_cast<unsigned int>(entry.compressedSize & 0xFFFFFFFF);
     HeaderData->PackSizeHigh = static_cast<unsigned int>(entry.compressedSize >> 32);
     
-    HeaderData->FileCRC = entry.crc32; // Zintegrowane przekazywanie CRC32
+    HeaderData->FileCRC = entry.crc32;
     HeaderData->FileAttr = (entry.type == acf::EntryType::Directory) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE;
     
     return 0;
@@ -99,7 +101,7 @@ extern "C" __declspec(dllexport) int __stdcall ProcessFileW(HANDLE hArcData, int
 
     if (Operation == PK_SKIP) return 0;
     
-    // Dodanie operacji PK_TEST. TC rozpakowuje plik w pamięci i sprawdza jego poprawność na bazie wartości HeaderData->FileCRC
+    // Support extracting and testing
     if (Operation != PK_EXTRACT && Operation != PK_TEST) return E_NOT_SUPPORTED;
 
     try {
@@ -107,6 +109,7 @@ extern "C" __declspec(dllexport) int __stdcall ProcessFileW(HANDLE hArcData, int
         const auto& entry = current.first;
         const auto& path = current.second;
 
+        // Create target directory
         if (entry.type == acf::EntryType::Directory) {
             if (Operation == PK_EXTRACT && DestName) {
                 std::filesystem::create_directories(DestName);
@@ -114,30 +117,64 @@ extern "C" __declspec(dllexport) int __stdcall ProcessFileW(HANDLE hArcData, int
             return 0;
         }
 
-        std::vector<uint8_t> data = state->archiver->ExtractData(WStringToString(state->archivePath), path);
-        
+        std::string targetPath = "";
         if (Operation == PK_EXTRACT) {
             if (!DestName || !*DestName) return E_ECREATE;
             std::filesystem::path finalDestPath(DestName);
             std::filesystem::create_directories(finalDestPath.parent_path());
-            
-            std::ofstream outFile(finalDestPath, std::ios::binary | std::ios::trunc);
-            if (!outFile) return E_ECREATE;
-            outFile.write(reinterpret_cast<const char*>(data.data()), data.size());
-
-            if (state->processDataProc) {
-                state->processDataProc((WCHAR*)finalDestPath.c_str(), data.size());
-            }
+            targetPath = WStringToString(DestName);
         }
+
+        // --- ZMIANA: Poprawa Callbacku rozpakowywania ---
+        // TC oczekuje w DestName pełnej ścieżki pliku na dysku. Przekazujemy DestName, jeśli istnieje.
+        std::wstring wDestName = DestName ? DestName : StringToWString(path);
+        
+        state->archiver->SetCallback([&state, wDestName](const std::string& /*name*/, uint64_t /*proc*/, uint64_t /*total*/, uint64_t chunk, float /*gen*/) -> bool {
+            if (state->processDataProc && chunk > 0) {
+                // TC dla funkcji ProcessDataProc oczekuje liczby zapisanych bajtów, a nie postępu w ułamku.
+                int res = state->processDataProc((WCHAR*)wDestName.c_str(), static_cast<int>(chunk));
+                // Total Commander zwraca 0 jako "Kontynuuj", a inne wartości (często 1) jako "Anuluj" (Abort)
+                if (res == 0) return false; // UWAGA! W API TC zwrócenie 0 oznacza PRZERWANIE z winy użytkownika.
+            }
+            return true; // Wszelkie inne wartości i brak processDataProc oznaczają: kontynuuj.
+        });
+
+        // Use Streaming to not saturate RAM with large files
+        state->archiver->ExtractSingleFile(WStringToString(state->archivePath), path, targetPath);
+
+    } catch (const std::exception& e) {
+        std::string err(e.what());
+        if (err.find("aborted") != std::string::npos) {
+            return E_EABORTED; // Total Commander wyświetli "Przerwano na życzenie użytkownika"
+        }
+        return E_EWRITE;
     } catch (...) {
         return E_EWRITE;
     }
     return 0;
 }
 
+extern "C" __declspec(dllexport) void __stdcall SetProcessDataProcW(HANDLE hArcData, tProcessDataProcW pProcessDataW) {
+    if (hArcData != (HANDLE)-1 && g_OpenArchives.count(hArcData)) {
+        g_OpenArchives[hArcData]->processDataProc = pProcessDataW;
+    }
+    g_PackProgressProc = pProcessDataW; // Cache-ujemy go również do globalnej akcji pakowania
+}
+
 extern "C" __declspec(dllexport) int __stdcall PackFilesW(WCHAR* PackedFile, WCHAR* SubPath, WCHAR* SrcPath, WCHAR* AddList, int Flags) {
     try {
         acf::ACFArchiver archiver;
+        
+        // --- ZMIANA: Dodanie obsługi paska podczas tworzenia (o ile TC załadował g_PackProgressProc przed wywołaniem) ---
+        archiver.SetCallback([PackedFile](const std::string& /*name*/, uint64_t /*proc*/, uint64_t /*total*/, uint64_t chunk, float /*gen*/) -> bool {
+            if (g_PackProgressProc && chunk > 0) {
+                // TC oczekuje, żeby dla postępu zgłaszać plik, do którego pakujemy, a rozmiar chunku to rozmiar "skompensowanych" danych
+                int res = g_PackProgressProc(PackedFile, static_cast<int>(chunk));
+                if (res == 0) return false; // TC anuluje akcję
+            }
+            return true;
+        });
+
         std::vector<std::string> files_to_add;
         for (const WCHAR* p = AddList; *p; p += wcslen(p) + 1) {
             std::filesystem::path full_path(SrcPath);
@@ -147,6 +184,13 @@ extern "C" __declspec(dllexport) int __stdcall PackFilesW(WCHAR* PackedFile, WCH
 
         std::string internal_path = SubPath ? WStringToString(SubPath) : "";
         archiver.Create(WStringToString(PackedFile), files_to_add, WStringToString(SrcPath), internal_path);
+
+    } catch (const std::exception& e) {
+        std::string err(e.what());
+        if (err.find("aborted") != std::string::npos) {
+            return E_EABORTED;
+        }
+        return E_ECREATE;
     } catch (...) {
         return E_ECREATE;
     }
@@ -172,10 +216,6 @@ extern "C" __declspec(dllexport) void __stdcall SetChangeVolProcW(HANDLE hArcDat
      if (g_OpenArchives.count(hArcData)) g_OpenArchives[hArcData]->changeVolProc = pChangeVolW;
 }
 
-extern "C" __declspec(dllexport) void __stdcall SetProcessDataProcW(HANDLE hArcData, tProcessDataProcW pProcessDataW) {
-    if (g_OpenArchives.count(hArcData)) g_OpenArchives[hArcData]->processDataProc = pProcessDataW;
-}
-
 extern "C" __declspec(dllexport) int __stdcall GetPackerCaps() {
     return PK_CAPS_NEW | PK_CAPS_MODIFY | PK_CAPS_MULTIPLE | PK_CAPS_DELETE | PK_CAPS_BY_CONTENT;
 }
@@ -184,23 +224,19 @@ extern "C" __declspec(dllexport) void __stdcall ConfigurePacker(HWND Parent, DWO
 
 // --- ANSI Wrappers ---
 
-extern "C" __declspec(dllexport) HANDLE __stdcall OpenArchive(tOpenArchiveData* ArchiveData)
-{
+extern "C" __declspec(dllexport) HANDLE __stdcall OpenArchive(tOpenArchiveData* ArchiveData) {
     if (ArchiveData) ArchiveData->OpenResult = E_NOT_SUPPORTED;
     return NULL;
 }
 
-extern "C" __declspec(dllexport) int __stdcall ReadHeader(HANDLE hArcData, tHeaderData* HeaderData)
-{
+extern "C" __declspec(dllexport) int __stdcall ReadHeader(HANDLE hArcData, tHeaderData* HeaderData) {
     return E_NOT_SUPPORTED;
 }
 
-extern "C" __declspec(dllexport) int __stdcall ProcessFile(HANDLE hArcData, int Operation, char* DestPath, char* DestName)
-{
+extern "C" __declspec(dllexport) int __stdcall ProcessFile(HANDLE hArcData, int Operation, char* DestPath, char* DestName) {
     return E_NOT_SUPPORTED;
 }
 
-extern "C" __declspec(dllexport) int __stdcall PackFiles(char* PackedFile, char* SubPath, char* SrcPath, char* AddList, int Flags)
-{
+extern "C" __declspec(dllexport) int __stdcall PackFiles(char* PackedFile, char* SubPath, char* SrcPath, char* AddList, int Flags) {
     return E_NOT_SUPPORTED;
 }

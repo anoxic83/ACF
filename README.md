@@ -81,3 +81,5 @@ Commands:
 - Fix create/append archive
 **v0.9.3**
 - Fix recursive duplicates
+**v0.9.4**
+- Fix progress bar (wcx and cli)
