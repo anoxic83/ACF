@@ -79,3 +79,5 @@ Commands:
 - First Initial Release
 **v0.9.2**
 - Fix create/append archive
+**v0.9.3**
+- Fix recursive duplicates

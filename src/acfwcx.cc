@@ -8,7 +8,6 @@
 #include <filesystem>
 #include <fstream>
 
-// --- Global State Management ---
 struct ArchiveState {
     std::unique_ptr<acf::ACFArchiver> archiver;
     std::vector<std::pair<acf::ACFEntryData, std::string>> entries;
@@ -21,22 +20,9 @@ struct ArchiveState {
 std::map<HANDLE, std::unique_ptr<ArchiveState>> g_OpenArchives;
 long g_NextHandle = 0;
 
-namespace {
-    // Helper to convert DOS date/time format to FILETIME
-    FILETIME DosDateTimeToFileTime(uint32_t dosDateTime) {
-        FILETIME ft, lft;
-        DosDateTimeToFileTime(static_cast<WORD>(dosDateTime >> 16), static_cast<WORD>(dosDateTime & 0xFFFF), &lft);
-        LocalFileTimeToFileTime(&lft, &ft); // Convert to UTC for setting
-        return ft;
-    }
-} // namespace
-
-// --- DLL Entry Point ---
 BOOL APIENTRY DllMain(HANDLE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     return TRUE;
 }
-
-// --- Packer Implementation ---
 
 extern "C" __declspec(dllexport) HANDLE __stdcall OpenArchiveW(tOpenArchiveDataW* ArchiveData) {
     if (!ArchiveData) return (HANDLE)-1;
@@ -46,18 +32,29 @@ extern "C" __declspec(dllexport) HANDLE __stdcall OpenArchiveW(tOpenArchiveDataW
     state->archivePath = ArchiveData->ArcName;
 
     try {
-        // List() will throw on error (bad format, bad crc etc.)
-        state->entries = state->archiver->List(WStringToString(state->archivePath));
-    } catch (const std::exception& e) {
-        // Map exception to Total Commander error codes
-        std::string what = e.what();
-        if (what.find("Not a valid") != std::string::npos) {
-            ArchiveData->OpenResult = E_UNKNOWN_FORMAT;
-        } else if (what.find("corrupted") != std::string::npos) {
-            ArchiveData->OpenResult = E_BAD_ARCHIVE;
-        } else {
+        std::ifstream archiveFile(std::filesystem::path(state->archivePath), std::ios::binary);
+        if (!archiveFile) {
             ArchiveData->OpenResult = E_EOPEN;
+            return (HANDLE)-1;
         }
+        acf::ACFHeader header;
+        archiveFile.read(reinterpret_cast<char*>(&header), sizeof(acf::ACFHeader));
+        if (header.magic != acf::ACF_MAGIC) {
+            ArchiveData->OpenResult = E_UNKNOWN_FORMAT;
+            return (HANDLE)-1;
+        }
+        archiveFile.seekg(header.centralDirOffset);
+        state->entries.reserve(header.entryCount);
+        for (uint64_t i = 0; i < header.entryCount; ++i) {
+            acf::ACFEntryData entry;
+            archiveFile.read(reinterpret_cast<char*>(&entry), sizeof(acf::ACFEntryData));
+            std::string path(entry.pathLength, '\0');
+            archiveFile.read(&path[0], entry.pathLength);
+            state->entries.emplace_back(entry, path);
+        }
+
+    } catch (...) {
+        ArchiveData->OpenResult = E_BAD_ARCHIVE;
         return (HANDLE)-1;
     }
 
@@ -82,11 +79,14 @@ extern "C" __declspec(dllexport) int __stdcall ReadHeaderExW(HANDLE hArcData, tH
     std::wstring wpath = StringToWString(path);
     wcsncpy_s(HeaderData->FileName, wpath.c_str(), _TRUNCATE);
 
-    HeaderData->UnpSize = entry.originalSize;
-    HeaderData->PackSize = entry.compressedSize;
-    HeaderData->FileCRC = entry.crc32;
-    HeaderData->FileTime = entry.filedatetime;
-    HeaderData->FileAttr = entry.fileattribute;
+    // FIX: Poprawne maskowanie dla plików powyżej 4GB! Total Commander tego wymaga.
+    HeaderData->UnpSize = static_cast<unsigned int>(entry.originalSize & 0xFFFFFFFF);
+    HeaderData->UnpSizeHigh = static_cast<unsigned int>(entry.originalSize >> 32);
+    HeaderData->PackSize = static_cast<unsigned int>(entry.compressedSize & 0xFFFFFFFF);
+    HeaderData->PackSizeHigh = static_cast<unsigned int>(entry.compressedSize >> 32);
+    
+    HeaderData->FileCRC = entry.crc32; // Zintegrowane przekazywanie CRC32
+    HeaderData->FileAttr = (entry.type == acf::EntryType::Directory) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE;
     
     return 0;
 }
@@ -97,39 +97,37 @@ extern "C" __declspec(dllexport) int __stdcall ProcessFileW(HANDLE hArcData, int
 
     if (state->currentEntryIndex < 0 || state->currentEntryIndex >= (int)state->entries.size()) return E_BAD_ARCHIVE;
 
-    const auto& current = state->entries[state->currentEntryIndex];
-    const auto& entry = current.first;
-    const auto& path = current.second;
-
     if (Operation == PK_SKIP) return 0;
-    if (Operation != PK_EXTRACT) return E_NOT_SUPPORTED;
+    
+    // Dodanie operacji PK_TEST. TC rozpakowuje plik w pamięci i sprawdza jego poprawność na bazie wartości HeaderData->FileCRC
+    if (Operation != PK_EXTRACT && Operation != PK_TEST) return E_NOT_SUPPORTED;
 
     try {
-        std::filesystem::path finalDestPath = DestName ? DestName : (std::filesystem::path(DestPath) / StringToWString(path));
+        const auto& current = state->entries[state->currentEntryIndex];
+        const auto& entry = current.first;
+        const auto& path = current.second;
 
         if (entry.type == acf::EntryType::Directory) {
-            std::filesystem::create_directories(finalDestPath);
-        } else {
+            if (Operation == PK_EXTRACT && DestName) {
+                std::filesystem::create_directories(DestName);
+            }
+            return 0;
+        }
+
+        std::vector<uint8_t> data = state->archiver->ExtractData(WStringToString(state->archivePath), path);
+        
+        if (Operation == PK_EXTRACT) {
+            if (!DestName || !*DestName) return E_ECREATE;
+            std::filesystem::path finalDestPath(DestName);
             std::filesystem::create_directories(finalDestPath.parent_path());
-            std::vector<uint8_t> data = state->archiver->ExtractData(WStringToString(state->archivePath), path);
             
             std::ofstream outFile(finalDestPath, std::ios::binary | std::ios::trunc);
             if (!outFile) return E_ECREATE;
             outFile.write(reinterpret_cast<const char*>(data.data()), data.size());
-            outFile.close();
-        }
 
-        // Set file time and attributes
-        HANDLE hFile = CreateFileW(finalDestPath.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            FILETIME ft = DosDateTimeToFileTime(entry.filedatetime);
-            SetFileTime(hFile, NULL, NULL, &ft);
-            CloseHandle(hFile);
-        }
-        SetFileAttributesW(finalDestPath.c_str(), entry.fileattribute);
-
-        if (state->processDataProc) {
-            state->processDataProc((WCHAR*)finalDestPath.c_str(), entry.originalSize);
+            if (state->processDataProc) {
+                state->processDataProc((WCHAR*)finalDestPath.c_str(), data.size());
+            }
         }
     } catch (...) {
         return E_EWRITE;
@@ -179,38 +177,30 @@ extern "C" __declspec(dllexport) void __stdcall SetProcessDataProcW(HANDLE hArcD
 }
 
 extern "C" __declspec(dllexport) int __stdcall GetPackerCaps() {
-    return PK_CAPS_NEW | PK_CAPS_MULTIPLE | PK_CAPS_BY_CONTENT;
+    return PK_CAPS_NEW | PK_CAPS_MODIFY | PK_CAPS_MULTIPLE | PK_CAPS_DELETE | PK_CAPS_BY_CONTENT;
 }
 
 extern "C" __declspec(dllexport) void __stdcall ConfigurePacker(HWND Parent, DWORD DllInstance) {}
 
-// --- ANSI Wrappers (not supported) ---
+// --- ANSI Wrappers ---
 
-extern "C" __declspec(dllexport) HANDLE __stdcall OpenArchive(tOpenArchiveData* ArchiveData) {
+extern "C" __declspec(dllexport) HANDLE __stdcall OpenArchive(tOpenArchiveData* ArchiveData)
+{
     if (ArchiveData) ArchiveData->OpenResult = E_NOT_SUPPORTED;
     return NULL;
 }
 
-extern "C" __declspec(dllexport) int __stdcall ReadHeader(HANDLE hArcData, tHeaderData* HeaderData) {
+extern "C" __declspec(dllexport) int __stdcall ReadHeader(HANDLE hArcData, tHeaderData* HeaderData)
+{
     return E_NOT_SUPPORTED;
 }
 
-extern "C" __declspec(dllexport) int __stdcall ProcessFile(HANDLE hArcData, int Operation, char* DestPath, char* DestName) {
+extern "C" __declspec(dllexport) int __stdcall ProcessFile(HANDLE hArcData, int Operation, char* DestPath, char* DestName)
+{
     return E_NOT_SUPPORTED;
 }
 
-extern "C" __declspec(dllexport) int __stdcall PackFiles(char* PackedFile, char* SubPath, char* SrcPath, char* AddList, int Flags) {
+extern "C" __declspec(dllexport) int __stdcall PackFiles(char* PackedFile, char* SubPath, char* SrcPath, char* AddList, int Flags)
+{
     return E_NOT_SUPPORTED;
 }
-
-extern "C" __declspec(dllexport) int __stdcall DeleteFiles(char* PackedFile, char* DeleteList) {
-    return E_NOT_SUPPORTED;
-}
-
-extern "C" __declspec(dllexport) BOOL __stdcall CanYouHandleThisFile(char* FileName) {
-    const char* ext = strrchr(FileName, '.');
-    return (ext && _stricmp(ext, ".acf") == 0);
-}
-
-extern "C" __declspec(dllexport) void __stdcall SetChangeVolProc(HANDLE hArcData, tChangeVolProc pChangeVol) {}
-extern "C" __declspec(dllexport) void __stdcall SetProcessDataProc(HANDLE hArcData, tProcessDataProc pProcessData) {}

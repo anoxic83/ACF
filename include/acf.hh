@@ -11,10 +11,8 @@ std::string WStringToString(const std::wstring& s);
 namespace acf
 {
   constexpr uint32_t ACF_MAGIC = 0x39464341;
-  constexpr uint32_t ACF_VERSION = 0x20000900;
+  constexpr uint32_t ACF_VERSION = 0x10000900;
 
-  // Callback function for progress reporting.
-  // Parameters: current file path, progress for the current file (0-1), overall progress (0-1).
   using CallbackFunc = std::function<void(const std::string& currentFile, float currentFileProgress, float generalProgress)>;
 
   enum class EntryType: uint8_t
@@ -30,8 +28,7 @@ namespace acf
     uint32_t version = ACF_VERSION;
     uint64_t centralDirOffset = 0;
     uint64_t entryCount = 0;
-    uint32_t centralDirCRC32 = 0;
-    uint32_t reserved = 0;
+    uint64_t reserved = static_cast<uint64_t>(-1);
   };
 
   struct ACFEntryData
@@ -41,8 +38,6 @@ namespace acf
     uint64_t compressedSize;
     uint64_t dataOffset;
     uint32_t crc32;
-    uint32_t filedatetime;
-    uint8_t fileattribute;
     uint16_t pathLength;
   };
   #pragma pack(pop)
@@ -75,8 +70,7 @@ namespace acf
     std::vector<uint8_t> ExtractData(const std::string& archivePath,
                                     const std::string& archFileName);
                                     
-    std::vector<std::pair<ACFEntryData, std::string>> List(const std::string& archivePath);
+    std::vector<std::string> List(const std::string& archivePath);
   };
-
 
 } // namespace acf
